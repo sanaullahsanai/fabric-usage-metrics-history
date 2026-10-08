@@ -1,0 +1,18 @@
+{
+  "workspaceName": "WS-UsageMetrics",
+  "capacityName": "<your Fabric capacity name>",
+  "capacityId": "",
+  "lakehouseName": "LH_UsageMetrics",
+  "notebookName": "NB_UsageMetricsHistory",
+  "semanticModelName": "Usage Metrics History",
+  "reportName": "Usage Metrics History",
+  "connectionName": "",
+
+  "sourceWorkspaces": ["<workspace name or id>"],
+  "templateWorkspace": "",
+
+  "retentionDays": 730,
+  "scheduleTime": "05:00",
+  "scheduleTimeZone": "UTC",
+  "exposeIdentity": true
+}

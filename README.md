@@ -78,7 +78,6 @@ Retention takes effect on the next scheduled run.
 ## Notes
 
 - Microsoft can change the built-in usage-metrics model. Re-running `Deploy.ps1` re-clones the current template.
-- The repository is private because the owning account is an Enterprise Managed User; there is no technical dependency on that.
 
 ## License
 

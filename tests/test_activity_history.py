@@ -182,6 +182,22 @@ class CollectorTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_workspace_and_report_filters_are_dropdowns(self):
+        parts = {k: json.loads(v) for k, v in artifacts.report_parts("model-id").items()}
+        for page in ("usage", "reports"):
+            for name, column in (("workspaces", "Workspace"), ("report", "Report")):
+                visual = parts[f"definition/pages/{page}/visuals/{name}/visual.json"]["visual"]
+                self.assertEqual(visual["visualType"], "slicer")
+                self.assertEqual(visual["objects"]["data"][0]["properties"]["mode"],
+                                 artifacts.literal("Dropdown"))
+                projection = visual["query"]["queryState"]["Values"]["projections"][0]
+                self.assertEqual(projection["field"], artifacts.field("Reports", column))
+                self.assertTrue(visual["drillFilterOtherVisuals"])
+            dates = parts[f"definition/pages/{page}/visuals/dates/visual.json"]["visual"]
+            self.assertNotIn("objects", dates)
+        self.assertNotIn("definition/pages/coverage/visuals/workspaces/visual.json", parts)
+        self.assertNotIn("definition/pages/coverage/visuals/report/visual.json", parts)
+
     def test_no_template_or_xmla_source(self):
         parts = artifacts.model_parts("server", "lakehouse")
         self.assertEqual(len([p for p in parts if "/tables/" in p]), 4)

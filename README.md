@@ -139,6 +139,11 @@ The script creates/reuses the workspace, identity, Lakehouse and SQL connection;
 publishes and runs the collector; builds and refreshes the first-party Import
 semantic model; and publishes the report. It prints the report URL.
 
+The **Report usage** and **Report list** pages include **Workspace** and
+**Report** dropdown filters alongside the UTC date slicer. Workspace and report
+selections filter the page's usage visuals. Collection coverage remains
+unfiltered so it shows the collector's overall ingestion health.
+
 To change settings after the audit tables have been initialized:
 
 ```powershell

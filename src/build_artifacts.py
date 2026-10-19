@@ -241,6 +241,10 @@ def report_parts(model_id):
             ] + visuals
         for spec in visuals:
             item = visual(*spec)
+            if spec[0] in ("workspaces", "report"):
+                item["visual"]["objects"] = {
+                    "data": [{"properties": {"mode": literal("Dropdown")}}],
+                }
             parts[f"definition/pages/{page}/visuals/{spec[0]}/visual.json"] = item
     return {path: json.dumps(value) for path, value in parts.items()}
 

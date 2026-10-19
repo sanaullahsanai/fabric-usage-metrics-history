@@ -22,6 +22,7 @@
 param(
     [string] $ConfigPath = (Join-Path $PSScriptRoot '..\config\settings.json'),
     [switch] $SkipNotebookRun,
+    [switch] $PreflightOnly,
     [int]    $TimeoutMinutes = 45
 )
 
@@ -58,6 +59,17 @@ $replay      = [int](Get-Setting 'replayDays' 3)
 $schedTime   = [string](Get-Setting 'scheduleTime' '05:00')
 $schedTz     = [string](Get-Setting 'scheduleTimeZone' 'UTC')
 $expose      = Get-Setting 'exposeIdentity' $false
+$tenantId    = [string](Get-Setting 'tenantId' '')
+$collectorId = [string](Get-Setting 'collectorUserObjectId' '')
+$collectorUpn = [string](Get-Setting 'collectorUserPrincipalName' '')
+
+# Pin the scheduled notebook to the user validated by the live API, even when
+# optional identity settings are left empty (use the current Azure CLI login).
+$collector = Test-CollectorAccess -TenantId $tenantId -UserObjectId $collectorId -UserPrincipalName $collectorUpn
+if ($PreflightOnly) {
+    $collector
+    return
+}
 
 if (-not $capName -and -not $capId) { throw "Set capacityName or capacityId in $ConfigPath." }
 if ($retention -lt 0) { throw "retentionDays must be 0 (keep forever) or a positive number of days." }
@@ -81,9 +93,6 @@ if ($legacy) {
     }
 }
 
-# Fail before changing the deployment if the administrator API is inaccessible.
-$probeDay = (Get-Date).ToUniversalTime().Date.AddDays(-1).ToString('yyyy-MM-dd')
-Invoke-Api -PowerBI -Path "admin/activityevents?startDateTime='$($probeDay)T00:00:00.000Z'&endDateTime='$($probeDay)T23:59:59.999Z'&`$filter=Activity%20eq%20'ViewReport'" | Out-Null
 & python --version | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Python 3 is required to build the model and report definitions.' }
 
@@ -185,6 +194,8 @@ $params = [ordered]@{
     REPLAY_DAYS         = "$replay"
     EXPOSE_IDENTITY     = $(if ($expose) { 'True' } else { 'False' })
     SEMANTIC_MODEL_NAME = (ConvertTo-PyString $modelName)
+    EXPECTED_TENANT_ID  = (ConvertTo-PyString $collector.TenantId)
+    COLLECTOR_USER_OBJECT_ID = (ConvertTo-PyString $collector.UserObjectId)
 }
 foreach ($k in $params.Keys) {
     $pattern = "(?m)^$k = .*$"

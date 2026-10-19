@@ -17,6 +17,8 @@ BACKFILL_DAYS = 27
 REPLAY_DAYS = 3
 EXPOSE_IDENTITY = False
 SEMANTIC_MODEL_NAME = "Tenant Usage Metrics"
+EXPECTED_TENANT_ID = ""
+COLLECTOR_USER_OBJECT_ID = ""
 
 API_ROOT = "https://api.powerbi.com/v1.0/myorg"
 STRING_FIELDS = [
@@ -33,6 +35,20 @@ VIEW_COLUMNS = [
 
 def utc_today():
     return datetime.now(timezone.utc).date()
+
+def validate_collector_identity(claims, tenant_id="", user_object_id=""):
+    if not claims.get("tid") or not claims.get("oid"):
+        raise PermissionError("Power BI token is missing tenant or user object identity")
+    if claims.get("idtyp") == "app" or not claims.get("scp"):
+        raise PermissionError("This collector requires the authorized user's delegated token")
+    if tenant_id and claims["tid"].lower() != tenant_id.lower():
+        raise PermissionError("Notebook is running in a different tenant than configured")
+    if user_object_id and claims["oid"].lower() != user_object_id.lower():
+        raise PermissionError(
+            "Notebook is running as a different user than the validated collector. "
+            "Sign in and create the schedule as the configured collection user."
+        )
+    return claims["tid"]
 
 
 def retention_cutoff(today, days):
@@ -177,7 +193,12 @@ def main():
     cutoff = retention_cutoff(today, RETENTION_DAYS)
     if not isinstance(EXPOSE_IDENTITY, bool):
         raise ValueError("exposeIdentity must be a JSON boolean")
-    token_provider = lambda: notebookutils.credentials.getToken("pbi")
+    def token_provider():
+        token = notebookutils.credentials.getToken("pbi")
+        claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==="))
+        validate_collector_identity(claims, EXPECTED_TENANT_ID, COLLECTOR_USER_OBJECT_ID)
+        return token
+
     token = token_provider()
     claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==="))
     tenant_id = claims["tid"]

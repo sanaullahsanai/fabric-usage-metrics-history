@@ -28,6 +28,60 @@ function Get-AccessToken {
     return $t.accessToken
 }
 
+function Get-CollectorIdentity {
+    param(
+        [Parameter(Mandatory)] $Claims,
+        [string] $TenantId = '',
+        [string] $UserObjectId = '',
+        [string] $UserPrincipalName = ''
+    )
+    foreach ($setting in @(@('tenantId', $TenantId), @('collectorUserObjectId', $UserObjectId))) {
+        if ($setting[1] -and $setting[1] -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+            throw "$($setting[0]) must be an Entra GUID or empty."
+        }
+    }
+    $properties = $Claims.PSObject.Properties
+    if (-not $properties['tid'] -or -not $properties['oid']) {
+        throw 'The Power BI token must identify an Entra tenant and user object.'
+    }
+    if (($properties['idtyp'] -and $Claims.idtyp -eq 'app') -or
+        -not ($properties['scp'] -and $Claims.scp)) {
+        throw 'This collector uses delegated user authentication. Run az login as the authorized collection user; app-only authentication is not configured.'
+    }
+    $name = ''
+    foreach ($claim in @('preferred_username', 'upn', 'unique_name')) {
+        if ($properties[$claim] -and $Claims.$claim) { $name = [string]$Claims.$claim; break }
+    }
+    if ($TenantId -and $Claims.tid -ne $TenantId) {
+        throw "Azure CLI is signed into a different tenant. Run az login --tenant $TenantId as the configured collection user."
+    }
+    if ($UserObjectId -and $Claims.oid -ne $UserObjectId) {
+        throw 'Azure CLI is signed into a different user object. Run az login as the configured collection user.'
+    }
+    if ($UserPrincipalName -and $name.Trim() -ine $UserPrincipalName.Trim()) {
+        throw 'Azure CLI is signed into a different user principal name. Run az login as collectorUserPrincipalName.'
+    }
+    return [pscustomobject]@{ TenantId = [string]$Claims.tid; UserObjectId = [string]$Claims.oid; UserPrincipalName = $name }
+}
+
+function Test-CollectorAccess {
+    param([string] $TenantId = '', [string] $UserObjectId = '', [string] $UserPrincipalName = '')
+    $token = Get-AccessToken 'https://analysis.windows.net/powerbi/api'
+    $payload = $token.Split('.')[1].Replace('-', '+').Replace('_', '/')
+    $payload = $payload.PadRight($payload.Length + ((4 - $payload.Length % 4) % 4), '=')
+    $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+    # Claims are used only to compare identities; the live API validates authorization.
+    $identity = Get-CollectorIdentity -Claims $claims -TenantId $TenantId -UserObjectId $UserObjectId -UserPrincipalName $UserPrincipalName
+    $day = (Get-Date).ToUniversalTime().Date.AddDays(-1).ToString('yyyy-MM-dd')
+    try {
+        Invoke-Api -PowerBI -Path "admin/activityevents?startDateTime='$($day)T00:00:00.000Z'&endDateTime='$($day)T23:59:59.999Z'&`$filter=Activity%20eq%20'ViewReport'" | Out-Null
+    } catch {
+        throw "Activity Events access check failed. Have your Entra administrator assign/activate Fabric Administrator for the collection user and approve the delegated Power BI permissions as required. Reauthenticate after consent/PIM activation. See README.md (Collection user and access setup). No roles or consent were changed. Original error: $($_.Exception.Message)"
+    }
+    Write-Step 'Collection identity matches configuration and Activity Events access is authorized.' 'Ok'
+    return $identity
+}
+
 function Invoke-Api {
     <#
         Calls the Fabric API (default) or the Power BI API (-PowerBI). Follows
@@ -124,4 +178,4 @@ function ConvertTo-DefinitionParts {
     }
 }
 
-Export-ModuleMember -Function Write-Step, Get-AccessToken, Invoke-Api, Wait-Operation, Get-ByName, ConvertFrom-DefinitionParts, ConvertTo-DefinitionParts
+Export-ModuleMember -Function Write-Step, Get-AccessToken, Get-CollectorIdentity, Test-CollectorAccess, Invoke-Api, Wait-Operation, Get-ByName, ConvertFrom-DefinitionParts, ConvertTo-DefinitionParts

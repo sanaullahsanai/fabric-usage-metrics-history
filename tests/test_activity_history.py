@@ -45,6 +45,23 @@ class Session:
 class CollectorTests(unittest.TestCase):
     today = date(2026, 10, 19)
 
+    def test_collector_identity_matches_pinned_tenant_and_user(self):
+        claims = {"tid": "tenant", "oid": "user", "scp": "user_impersonation"}
+        self.assertEqual(
+            collector.validate_collector_identity(claims, "TENANT", "USER"), "tenant"
+        )
+        self.assertEqual(collector.validate_collector_identity(claims), "tenant")
+
+    def test_collector_identity_rejects_wrong_runtime_user_or_tenant(self):
+        claims = {"tid": "tenant", "oid": "user", "scp": "user_impersonation"}
+        for tenant, user in (("other", "user"), ("tenant", "other")):
+            with self.assertRaises(PermissionError):
+                collector.validate_collector_identity(claims, tenant, user)
+        for invalid in ({}, {"tid": "tenant"}, {"tid": "tenant", "oid": "user"},
+                        dict(claims, idtyp="app")):
+            with self.assertRaises(PermissionError):
+                collector.validate_collector_identity(invalid)
+
     def test_initial_backfill_is_within_28_day_api_window(self):
         days = collector.days_to_fetch(self.today, set(), 27, 3)
         self.assertEqual(len(days), 27)

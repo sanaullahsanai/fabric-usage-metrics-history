@@ -66,3 +66,10 @@ The schedule owner must retain tenant admin API authorization. Capacity must
 be active at run time. Alert on failed notebook jobs and inspect
 `audit_ingestion_days` for coverage, not merely nonzero report counts.
 The collector cannot reconstruct days that expired before collection began.
+
+Configure `tenantId`, `collectorUserPrincipalName` and `collectorUserObjectId`
+to identify the already-authorized user. `Deploy.ps1 -PreflightOnly` compares
+the signed-in identity and makes a read-only Activity Events request. It never
+grants roles or consent. The validated tenant and user object ID are injected
+into the notebook and checked whenever it obtains a token, preventing a
+schedule owner change from silently changing the collection identity.

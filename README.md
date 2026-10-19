@@ -43,6 +43,64 @@ Service-principal collection would need separately configured admin API access
 and an appropriate notebook execution identity; setting up the workspace
 identity does not grant it tenant administration.
 
+### Collection user and access setup
+
+Set these alongside the other parameters in `config/settings.json`:
+
+```json
+{
+  "tenantId": "<Entra tenant GUID>",
+  "collectorUserPrincipalName": "collector@contoso.com",
+  "collectorUserObjectId": "<user object GUID in that tenant>"
+}
+```
+
+These fields **select and validate an already-authorized user**. They do not
+assign roles, grant consent, impersonate that user, or store a password/token.
+Object ID is the stable identifier; a changed UPN requires updating the
+configured UPN. Leave fields empty to use the current signed-in identity.
+Deployment always pins the notebook to the validated tenant and user object
+ID, including when the configuration fields are empty.
+
+1. Have your organization's authorized Entra administrator assign the
+   **Fabric Administrator** role to the collection user. If governed through
+   Privileged Identity Management (PIM), activate it before deployment and
+   collection. A short-lived activation alone is not enough for unattended
+   daily collection: the owner must be authorized when each job runs.
+2. For a custom delegated client application, request Power BI Service
+   **`Tenant.Read.All`** (or the broader `Tenant.ReadWrite.All` only if needed)
+   and have an authorized administrator grant tenant consent where required.
+   Azure CLI and Fabric notebook tokens are issued to their own client
+   applications; consent to a separate custom app does not authorize those
+   clients. Do not paste access tokens or secrets into this configuration.
+3. Sign in as the configured user:
+   `az login --tenant <tenantId>`. This setting does not switch Azure CLI
+   accounts automatically.
+4. Run the non-mutating check:
+
+   ```powershell
+   .\deploy\Deploy.ps1 -PreflightOnly
+   ```
+
+   It compares token identity claims with the settings and calls Activity
+   Events to verify **effective API access**, without creating workspace
+   items or changing roles/consent. An empty result page still proves access;
+   the collection job follows pagination to obtain all data. Scope claims
+   vary by first-party client, so scope text alone is not used to infer
+   authorization.
+5. Deploy as that user so the daily schedule is created under the authorized
+   account. Every notebook token acquisition checks the pinned tenant/user.
+   The first notebook run also verifies API access using the runtime token.
+   Workspace Contributor+ access is needed for collection/deployment work;
+   tenant admin access does not automatically grant workspace membership.
+
+Changing these settings requires signing in as the new user and redeploying;
+it does not transfer ownership by itself. A 401/403 fails explicitly with
+setup guidance. Do not grant Global Administrator solely to run this collector.
+
+[Activity Events permissions](https://learn.microsoft.com/rest/api/power-bi/admin/get-activity-events)
+and [Assign Microsoft Entra roles](https://learn.microsoft.com/entra/identity/role-based-access-control/manage-roles-portal).
+
 ## Configuration
 
 Copy `config/settings.example.json` to gitignored `config/settings.json`.
@@ -56,6 +114,9 @@ Copy `config/settings.example.json` to gitignored `config/settings.json`.
 | `semanticModelName` | `Tenant Usage Metrics` |
 | `reportName` | `Usage Metrics History` |
 | `connectionName` | Empty generates `<workspace>-<lakehouse>-SQL` |
+| `tenantId` | Expected Entra tenant GUID; empty uses the current login |
+| `collectorUserPrincipalName` | Expected authorized user's UPN; empty uses the current login |
+| `collectorUserObjectId` | Expected user's Entra object GUID; empty uses the current login |
 | `retentionDays` | `730`; `0` keeps indefinitely. Counts calendar dates including today |
 | `backfillDays` | `27`; initial completed UTC days to retrieve, range `1..27` |
 | `replayDays` | `3`; recent days to reread for late arrivals, range `1..27` |
@@ -135,6 +196,7 @@ the monitoring workspace/report: tenant-wide usage is sensitive.
 
 ```powershell
 python -m unittest discover -s tests -v
+.\tests\Test-CollectorAccess.ps1
 ```
 
 ## References

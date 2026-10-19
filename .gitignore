@@ -1,3 +1,5 @@
 config/settings.json
 out/
 *.log
+__pycache__/
+*.pyc

@@ -4,15 +4,14 @@
   "capacityId": "",
   "lakehouseName": "LH_UsageMetrics",
   "notebookName": "NB_UsageMetricsHistory",
-  "semanticModelName": "Usage Metrics History",
+  "semanticModelName": "Tenant Usage Metrics",
   "reportName": "Usage Metrics History",
   "connectionName": "",
 
-  "sourceWorkspaces": ["<workspace name or id>"],
-  "templateWorkspace": "",
-
   "retentionDays": 730,
+  "backfillDays": 27,
+  "replayDays": 3,
   "scheduleTime": "05:00",
   "scheduleTimeZone": "UTC",
-  "exposeIdentity": true
+  "exposeIdentity": false
 }

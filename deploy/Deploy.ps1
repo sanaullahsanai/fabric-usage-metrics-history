@@ -5,12 +5,11 @@
 .DESCRIPTION
      1. Workspace on the capacity, with a workspace identity
      2. Lakehouse (and its SQL analytics endpoint)
-     3. Snapshot notebook with settings injected + daily schedule
-     4. First notebook run (creates the usage_metrics_* and um_* tables)
+     3. Tenant-wide Activity Events notebook with settings + daily schedule
+     4. First notebook run (creates audit_* tables without touching old snapshots)
      5. Cloud connection to the SQL endpoint using the workspace identity
-     6. Semantic model cloned from Microsoft's Usage Metrics Report model,
-        with its six data sources switched to the lakehouse; bound and refreshed
-     7. Report cloned from Microsoft's Usage Metrics Report, bound to the model
+     6. First-party semantic model reading retained report-open audit events
+     7. Report usage, report list, and collection coverage report pages
 
     Settings come from config\settings.json (copy config\settings.example.json).
 
@@ -50,37 +49,48 @@ $capName     = Get-Setting 'capacityName' ''
 $capId       = Get-Setting 'capacityId' ''
 $lhName      = Get-Setting 'lakehouseName' 'LH_UsageMetrics'
 $nbName      = Get-Setting 'notebookName' 'NB_UsageMetricsHistory'
-$modelName   = Get-Setting 'semanticModelName' 'Usage Metrics History'
+$modelName   = Get-Setting 'semanticModelName' 'Tenant Usage Metrics'
 $reportName  = Get-Setting 'reportName' 'Usage Metrics History'
 $connName    = Get-Setting 'connectionName' "$wsName-$lhName-SQL"
-$sources     = @(Get-Setting 'sourceWorkspaces' @() | Where-Object { $_ })
-$template    = Get-Setting 'templateWorkspace' ''
 $retention   = [int](Get-Setting 'retentionDays' 730)
+$backfill    = [int](Get-Setting 'backfillDays' 27)
+$replay      = [int](Get-Setting 'replayDays' 3)
 $schedTime   = [string](Get-Setting 'scheduleTime' '05:00')
 $schedTz     = [string](Get-Setting 'scheduleTimeZone' 'UTC')
-$expose      = [bool](Get-Setting 'exposeIdentity' $true)
+$expose      = Get-Setting 'exposeIdentity' $false
 
 if (-not $capName -and -not $capId) { throw "Set capacityName or capacityId in $ConfigPath." }
 if ($retention -lt 0) { throw "retentionDays must be 0 (keep forever) or a positive number of days." }
+if ($backfill -lt 1 -or $backfill -gt 27) { throw 'backfillDays must be between 1 and 27.' }
+if ($replay -lt 1 -or $replay -gt 27) { throw 'replayDays must be between 1 and 27.' }
+if ($expose -isnot [bool]) { throw 'exposeIdentity must be a JSON boolean.' }
 if ($retention -gt 0 -and $retention -lt 31) { Write-Step "retentionDays=$retention keeps less than the 30 days the built-in report already has." 'Warn' }
 if ($schedTime -notmatch '^([01]\d|2[0-3]):[0-5]\d$') { throw "scheduleTime must be HH:mm (24h), not '$schedTime'." }
 try { [void][TimeZoneInfo]::FindSystemTimeZoneById($schedTz) } catch { throw "scheduleTimeZone '$schedTz' is not a Windows time zone id (e.g. 'UTC', 'AUS Eastern Standard Time'). List them with: Get-TimeZone -ListAvailable" }
-if (-not $template) {
-    if ($sources.Count -eq 0) { throw "Set templateWorkspace (or sourceWorkspaces) so the Usage Metrics Report can be cloned." }
-    $template = $sources[0]
+if ($cfg.PSObject.Properties['sourceWorkspaces'] -or $cfg.PSObject.Properties['templateWorkspace']) {
+    Write-Step 'sourceWorkspaces/templateWorkspace are obsolete: collection now covers the whole tenant.' 'Warn'
 }
+$legacy = Get-ByName -Path 'workspaces' -Name $wsName
+if ($legacy) {
+    $existing = Get-ByName -Path "workspaces/$($legacy.id)/semanticModels" -Name $modelName
+    if ($existing) {
+        $existingDefinition = Invoke-Api -Path "workspaces/$($legacy.id)/semanticModels/$($existing.id)/getDefinition?format=TMDL" -Method POST
+        if ($existingDefinition.definition.parts.path -contains 'definition/tables/Report page views.tmdl') {
+            throw "The existing '$modelName' is the legacy XMLA model. Set semanticModelName to a new name such as 'Tenant Usage Metrics'. Its calculated partitions cannot be replaced in place."
+        }
+    }
+}
+
+# Fail before changing the deployment if the administrator API is inaccessible.
+$probeDay = (Get-Date).ToUniversalTime().Date.AddDays(-1).ToString('yyyy-MM-dd')
+Invoke-Api -PowerBI -Path "admin/activityevents?startDateTime='$($probeDay)T00:00:00.000Z'&endDateTime='$($probeDay)T23:59:59.999Z'&`$filter=Activity%20eq%20'ViewReport'" | Out-Null
+& python --version | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Python 3 is required to build the model and report definitions.' }
 
 $retentionText = if ($retention -eq 0) { 'forever' } else { "$retention days" }
 Write-Host ''
 Write-Host "=== Usage Metrics History -> '$wsName' ===" -ForegroundColor White
-Write-Step "Sources: $(if ($sources.Count) { $sources -join ', ' } else { 'all accessible workspaces' }) | retention: $retentionText | daily at $schedTime ($schedTz)"
-
-function Resolve-Workspace([string] $NameOrId) {
-    if ($NameOrId -match '^[0-9a-fA-F-]{36}$') { return (Invoke-Api -Path "workspaces/$NameOrId") }
-    $w = Get-ByName -Path 'workspaces' -Name $NameOrId
-    if (-not $w) { throw "Workspace '$NameOrId' not found or not accessible." }
-    return $w
-}
+Write-Step "Source: tenant-wide Admin Activity Events | retention: $retentionText | daily at $schedTime ($schedTz)"
 
 # ----------------------------------------------------------------------------
 # 1. Workspace, capacity, identity
@@ -96,7 +106,7 @@ if ($cap.state -ne 'Active') { throw "Capacity '$($cap.displayName)' is $($cap.s
 
 $ws = Get-ByName -Path 'workspaces' -Name $wsName
 if (-not $ws) {
-    $ws = Invoke-Api -Path 'workspaces' -Method POST -Body @{ displayName = $wsName; capacityId = $cap.id; description = 'Usage Metrics History: daily snapshots of Power BI usage metrics.' }
+    $ws = Invoke-Api -Path 'workspaces' -Method POST -Body @{ displayName = $wsName; capacityId = $cap.id; description = 'Tenant-wide report usage from Power BI Admin Activity Events.' }
     Write-Step "Created workspace '$wsName' ($($ws.id))." 'Ok'
 } else {
     Write-Step "Workspace '$wsName' exists ($($ws.id))." 'Skip'
@@ -169,10 +179,10 @@ function ConvertTo-NotebookCells([string] $Text) {
 }
 
 $py = Get-Content -LiteralPath (Join-Path $repoRoot 'src\notebook\usage_metrics_history.py') -Raw
-$pyList = '[' + (($sources | ForEach-Object { ConvertTo-PyString $_ }) -join ', ') + ']'
 $params = [ordered]@{
-    SOURCE_WORKSPACES   = $pyList
     RETENTION_DAYS      = "$retention"
+    BACKFILL_DAYS       = "$backfill"
+    REPLAY_DAYS         = "$replay"
     EXPOSE_IDENTITY     = $(if ($expose) { 'True' } else { 'False' })
     SEMANTIC_MODEL_NAME = (ConvertTo-PyString $modelName)
 }
@@ -201,7 +211,7 @@ if ($nb) {
     Invoke-Api -Path "workspaces/$wsId/notebooks/$($nb.id)/updateDefinition" -Method POST -Body @{ definition = $nbDef } | Out-Null
     Write-Step "Updated notebook '$nbName'." 'Ok'
 } else {
-    Invoke-Api -Path "workspaces/$wsId/notebooks" -Method POST -Body @{ displayName = $nbName; description = 'Daily snapshot of the Power BI Usage Metrics model(s) into the lakehouse.'; definition = $nbDef } | Out-Null
+    Invoke-Api -Path "workspaces/$wsId/notebooks" -Method POST -Body @{ displayName = $nbName; description = 'Tenant-wide Power BI report usage via Admin Activity Events REST API.'; definition = $nbDef } | Out-Null
     $nb = Get-ByName -Path "workspaces/$wsId/notebooks" -Name $nbName
     Write-Step "Created notebook '$nbName' ($($nb.id))." 'Ok'
 }
@@ -228,20 +238,39 @@ Write-Step "Scheduled '$nbName' daily at $schedTime ($schedTz)." 'Ok'
 # ----------------------------------------------------------------------------
 
 if (-not $SkipNotebookRun) {
-    Write-Step "Running '$nbName' (takes a few minutes)..."
-    $runBody = @{ executionData = @{ configuration = @{ defaultLakehouse = @{ name = $lhName; id = $lh.id; workspaceId = $wsId } } } }
-    $resp = Invoke-Api -Path "workspaces/$wsId/items/$($nb.id)/jobs/instances?jobType=RunNotebook" -Method POST -Body $runBody -NoWait
-    $jobUrl = @($resp.Headers['Location'])[0]
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-    do {
-        Start-Sleep -Seconds 20
-        $job = Invoke-Api -Path $jobUrl
-    } while ($job.status -notin 'Completed', 'Failed', 'Cancelled', 'Deduped' -and (Get-Date) -lt $deadline)
-    if ($job.status -ne 'Completed') {
-        $why = if ($job.PSObject.Properties['failureReason'] -and $job.failureReason) { $job.failureReason.message } else { '' }
-        throw "Notebook run ended as '$($job.status)'. $why Open '$nbName' in '$wsName' to see the output."
+    $recent = @((Invoke-Api -Path "workspaces/$wsId/items/$($nb.id)/jobs/instances").value |
+        Where-Object { $_.status -in 'NotStarted', 'InProgress' })
+    if ($recent.Count) { throw "A notebook run is already active. Wait for it before deploying." }
+    # Bootstrap the tables before the new model exists; enable refresh after deployment.
+    $bootstrapText = $py -replace '(?m)^SEMANTIC_MODEL_NAME = .*$', 'SEMANTIC_MODEL_NAME = ""'
+    $bootstrap = $ipynb | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+    $bootstrap.cells = @([ordered]@{
+        cell_type = 'code'; source = @($bootstrapText -split "`n" | ForEach-Object { "$_`n" })
+        metadata = @{}; outputs = @(); execution_count = $null
+    })
+    $bootstrapDef = @{ format = 'ipynb'; parts = @(@{
+        path = 'notebook-content.ipynb'; payloadType = 'InlineBase64'
+        payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($bootstrap | ConvertTo-Json -Depth 30)))
+    }) }
+    Invoke-Api -Path "workspaces/$wsId/notebooks/$($nb.id)/updateDefinition" -Method POST -Body @{ definition = $bootstrapDef } | Out-Null
+    try {
+        Write-Step "Running '$nbName' (takes a few minutes)..."
+        $runBody = @{ executionData = @{ configuration = @{ defaultLakehouse = @{ name = $lhName; id = $lh.id; workspaceId = $wsId } } } }
+        $resp = Invoke-Api -Path "workspaces/$wsId/items/$($nb.id)/jobs/instances?jobType=RunNotebook" -Method POST -Body $runBody -NoWait
+        $jobUrl = @($resp.Headers['Location'])[0]
+        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        do {
+            Start-Sleep -Seconds 20
+            $job = Invoke-Api -Path $jobUrl
+        } while ($job.status -notin 'Completed', 'Failed', 'Cancelled', 'Deduped' -and (Get-Date) -lt $deadline)
+        if ($job.status -ne 'Completed') {
+            $why = if ($job.PSObject.Properties['failureReason'] -and $job.failureReason) { $job.failureReason.message } else { '' }
+            throw "Notebook run ended as '$($job.status)'. $why Open '$nbName' in '$wsName' to see the output."
+        }
+        Write-Step 'Notebook run completed.' 'Ok'
+    } finally {
+        Invoke-Api -Path "workspaces/$wsId/notebooks/$($nb.id)/updateDefinition" -Method POST -Body @{ definition = $nbDef } | Out-Null
     }
-    Write-Step 'Notebook run completed.' 'Ok'
 }
 
 # ----------------------------------------------------------------------------
@@ -273,69 +302,14 @@ if (-not $conn) {
 # 6. Semantic model
 # ----------------------------------------------------------------------------
 
-$tplWs = Resolve-Workspace $template
-$tplModel = Get-ByName -PowerBI -Path "groups/$($tplWs.id)/datasets" -Name 'Usage Metrics Report'
-$tplReport = Get-ByName -PowerBI -Path "groups/$($tplWs.id)/reports" -Name 'Usage Metrics Report'
-if (-not $tplModel -or -not $tplReport) {
-    throw "No 'Usage Metrics Report' in '$($tplWs.displayName)'. Open 'View usage metrics report' on any report in that workspace once, then re-run."
-}
-Write-Step "Template: Usage Metrics Report in '$($tplWs.displayName)'."
-
-$partitions = [ordered]@{
-    'Report views'      = 'um_report_views'
-    'Report page views' = 'um_report_page_views'
-    'Report load times' = 'um_report_load_times'
-    'Reports'           = 'um_reports'
-    'Report pages'      = 'um_report_pages'
-    'Report rank'       = 'um_report_rank'
-}
-
-function Set-LakehousePartition([string] $Text, [string] $Item) {
-    $nl = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $lines = $Text -split "`r?`n"
-    $start = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\tpartition .+ = m\s*$') { $start = $i; break } }
-    if ($start -lt 0) { throw "No M partition found for $Item." }
-    $end = $lines.Count
-    for ($j = $start + 1; $j -lt $lines.Count; $j++) { if ($lines[$j] -match '^\t\S') { $end = $j; break } }
-    $new = @(
-        $lines[$start]
-        "`t`tmode: import"
-        "`t`tsource ="
-        "`t`t`t`tlet"
-        "`t`t`t`t    Source = Sql.Database(SqlEndpoint, LakehouseName),"
-        "`t`t`t`t    Data = Source{[Schema=`"dbo`", Item=`"$Item`"]}[Data]"
-        "`t`t`t`tin"
-        "`t`t`t`t    Data"
-        ''
-    )
-    $out = @()
-    if ($start -gt 0) { $out += $lines[0..($start - 1)] }
-    $out += $new
-    if ($end -lt $lines.Count) { $out += $lines[$end..($lines.Count - 1)] }
-    return ($out -join $nl)
-}
-
-$modelParts = ConvertFrom-DefinitionParts (Invoke-Api -Path "workspaces/$($tplWs.id)/semanticModels/$($tplModel.id)/getDefinition?format=TMDL" -Method POST).definition.parts
-foreach ($k in @($modelParts.Keys)) { if ($k -match '(^|/)\.') { $modelParts.Remove($k) } }
-foreach ($t in $partitions.Keys) {
-    $key = "definition/tables/$t.tmdl"
-    if (-not $modelParts.Contains($key)) { throw "Template model has no table '$t'; its layout has changed." }
-    $modelParts[$key] = Set-LakehousePartition $modelParts[$key] $partitions[$t]
-}
-$expr = $modelParts['definition/expressions.tmdl']
-$nl = if ($expr.Contains("`r`n")) { "`r`n" } else { "`n" }
-foreach ($p in @(@('SqlEndpoint', $sqlServer), @('LakehouseName', $lhName))) {
-    $expr = $expr.TrimEnd() + $nl + $nl +
-        "expression $($p[0]) = `"$($p[1])`" meta [IsParameterQuery = true, IsParameterQueryRequired = true, Type = `"Text`"]" + $nl +
-        "`tlineageTag: $([guid]::NewGuid())" + $nl + $nl +
-        "`tannotation PBI_ResultType = Text" + $nl
-}
-$modelParts['definition/expressions.tmdl'] = $expr
-$modelDef = @{ parts = @(ConvertTo-DefinitionParts $modelParts) }
+$builder = Join-Path $repoRoot 'src\build_artifacts.py'
+$modelJson = & python $builder --kind model --server $sqlServer --database $lhName
+if ($LASTEXITCODE -ne 0) { throw 'Model definition generation failed.' }
+$modelDef = $modelJson | ConvertFrom-Json
 
 $model = Get-ByName -Path "workspaces/$wsId/semanticModels" -Name $modelName
 if ($model) {
+    Invoke-Api -Path "workspaces/$wsId/semanticModels/$($model.id)/getDefinition?format=TMDL" -Method POST | Out-Null
     Invoke-Api -Path "workspaces/$wsId/semanticModels/$($model.id)/updateDefinition" -Method POST -Body @{ definition = $modelDef } | Out-Null
     Write-Step "Updated semantic model '$modelName'." 'Ok'
 } else {
@@ -344,9 +318,14 @@ if ($model) {
     Write-Step "Created semantic model '$modelName' ($($model.id))." 'Ok'
 }
 
+$references = @((Invoke-Api -Path "workspaces/$wsId/items/$($model.id)/connections").value |
+    Where-Object { $_.connectionDetails.type -eq 'SQL' -and $_.connectionDetails.path -eq $connPath })
+if ($references.Count -ne 1) { throw 'Expected one SQL data source reference matching the Lakehouse connection.' }
 Invoke-Api -Path "workspaces/$wsId/semanticModels/$($model.id)/bindConnection" -Method POST -Body @{
-    connectionBinding = @{ id = $conn.id; connectivityType = 'ShareableCloud'; connectionDetails = @{ type = 'SQL'; path = $connPath } }
+    connectionBinding = @{ id = $conn.id; connectivityType = 'ShareableCloud'; connectionDetails = $references[0].connectionDetails }
 } | Out-Null
+$bindings = @((Invoke-Api -Path "workspaces/$wsId/items/$($model.id)/connections").value)
+if (-not ($bindings | Where-Object { $_.id -eq $conn.id })) { throw 'Connection binding readback did not match the requested connection.' }
 Write-Step "Bound the model to connection '$connName'." 'Ok'
 
 Write-Step 'Syncing SQL endpoint metadata...'
@@ -375,23 +354,9 @@ Write-Step 'Model refresh completed.' 'Ok'
 # 7. Report
 # ----------------------------------------------------------------------------
 
-$reportParts = ConvertFrom-DefinitionParts (Invoke-Api -Path "workspaces/$($tplWs.id)/reports/$($tplReport.id)/getDefinition" -Method POST).definition.parts
-foreach ($k in @($reportParts.Keys)) { if ($k -match '(^|/)\.') { $reportParts.Remove($k) } }
-$reportParts['definition.pbir'] = ([ordered]@{
-    '$schema'        = 'https://developer.microsoft.com/json-schemas/fabric/item/report/definitionProperties/2.0.0/schema.json'
-    version          = '4.0'
-    datasetReference = @{ byConnection = @{
-        connectionString = "Data Source=`"powerbi://api.powerbi.com/v1.0/myorg/$wsName`";initial catalog=`"$modelName`";integrated security=ClaimsToken;semanticmodelid=$($model.id)" } }
-} | ConvertTo-Json -Depth 5)
-
-# The FAQ describes the built-in 30-day window; describe the retained history instead.
-$faqOld = 'The usage report is based on activity data for the last 30 days'
-$faqNew = if ($retention -eq 0) { 'The usage report is based on daily snapshots of the activity data, kept with no time limit' }
-          else { "The usage report is based on daily snapshots of the activity data for up to the last $retention days" }
-foreach ($k in @($reportParts.Keys)) {
-    if ($reportParts[$k] -is [string] -and $reportParts[$k].Contains($faqOld)) { $reportParts[$k] = $reportParts[$k].Replace($faqOld, $faqNew) }
-}
-$reportDef = @{ parts = @(ConvertTo-DefinitionParts $reportParts) }
+$reportJson = & python $builder --kind report --model-id $model.id
+if ($LASTEXITCODE -ne 0) { throw 'Report definition generation failed.' }
+$reportDef = $reportJson | ConvertFrom-Json
 
 $report = Get-ByName -Path "workspaces/$wsId/reports" -Name $reportName
 if ($report) {
@@ -402,6 +367,8 @@ if ($report) {
     $report = Get-ByName -Path "workspaces/$wsId/reports" -Name $reportName
     Write-Step "Created report '$reportName' ($($report.id))." 'Ok'
 }
+
+Invoke-Api -Path "workspaces/$wsId/notebooks/$($nb.id)/updateDefinition" -Method POST -Body @{ definition = $nbDef } | Out-Null
 
 Write-Host ''
 Write-Host 'Done.' -ForegroundColor Green

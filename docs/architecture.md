@@ -1,95 +1,68 @@
 # Architecture
 
-## Components
-
 ```mermaid
 flowchart LR
-    subgraph SRC["Source workspaces (one or many)"]
-        UMR["Usage Metrics Report<br/>semantic model (built-in, ~30 days)"]
-    end
-
-    subgraph WS["WS-UsageMetrics (Fabric capacity)"]
-        NB["NB_UsageMetricsHistory<br/>notebook, daily schedule"]
-        subgraph LH["LH_UsageMetrics (Lakehouse)"]
-            RAW["usage_metrics_*<br/>raw, append-only snapshots"]
-            CUR["um_*<br/>curated, deduplicated"]
-        end
-        SQL["SQL analytics endpoint"]
-        CONN["Cloud connection<br/>(workspace identity)"]
-        SM["Usage Metrics History<br/>semantic model (Import)"]
-        RPT["Usage Metrics History<br/>report"]
-    end
-
-    UMR -- "XMLA / DAX EVALUATE<br/>(semantic-link)" --> NB
-    NB -- "append" --> RAW
-    RAW -- "dedupe + retention" --> CUR
-    CUR --> SQL
-    SQL -- "Sql.Database" --> CONN --> SM
-    NB -- "refresh trigger" --> SM
-    SM --> RPT
+    A["Power BI tenant<br/>Admin Activity Events<br/>ViewReport, last 28 days"]
+    B["Scheduled Fabric notebook<br/>delegated admin identity"]
+    C["audit_report_events<br/>Delta MERGE by tenant + event ID"]
+    D["audit_ingestion_days<br/>completed UTC-day checkpoints"]
+    E["audit_report_views<br/>audit_reports<br/>audit_dates"]
+    F["SQL endpoint<br/>workspace-identity connection"]
+    G["Tenant Usage Metrics<br/>Import semantic model"]
+    H["Report usage<br/>Report list<br/>Collection coverage"]
+    A --> B --> C --> E --> F --> G --> H
+    B --> D
+    B -->|"sync metadata, refresh and wait"| G
 ```
 
 ## Daily flow
 
-```mermaid
-sequenceDiagram
-    participant S as Fabric scheduler
-    participant N as Notebook
-    participant U as Source Usage Metrics model(s)
-    participant L as Lakehouse
-    participant M as Usage Metrics History model
-    S->>N: run at scheduleTime (scheduleTimeZone)
-    N->>U: discover models in sourceWorkspaces
-    N->>U: EVALUATE 6 source tables (retry on transient errors)
-    N->>L: append usage_metrics_* with SnapshotUtc + SourceWorkspace
-    N->>L: retention delete (older than retentionDays)
-    N->>L: rebuild um_* (best snapshot per day, latest dims)
-    N->>L: compact settled raw days (> 35 days old)
-    N->>L: sync SQL endpoint metadata
-    N->>M: request full refresh
-    M->>L: import um_* via SQL endpoint (workspace identity)
-```
+1. Get a Power BI token for the notebook owner, who must have tenant Activity
+   Events access. Do not confuse this identity with the model's SQL identity.
+2. Select uncollected UTC days inside the retrievable window, plus `replayDays`
+   of recently completed days. Bootstrap uses `backfillDays` (default 27).
+3. Read every continuation token, including tokens on empty pages. Respect
+   throttling, request budgets and bounded retries. Authentication failures stop.
+4. Normalize report-open events and optionally hash user identifiers before
+   storing them. IP addresses and arbitrary raw payloads are not retained.
+5. MERGE pages into raw Delta by tenant/event ID. Partial runs are safe to retry;
+   only a completely paginated day gets a completion checkpoint.
+6. Remove rows older than the exact calendar-day retention cutoff. Logical
+   deletion is not physical erasure from Delta transaction history/backups.
+7. Build fact/dimension/calendar tables from all retained successful opens.
+   Use stable report keys containing tenant, workspace and report identifiers.
+   Names represent the latest observed metadata.
+8. Fail explicitly on known historical collection gaps beyond the API horizon.
+9. Sync SQL metadata and request a semantic-model refresh through REST. Wait
+   for completion; failures propagate to the notebook run.
 
-## Deployment flow (`deploy\Deploy.ps1`)
+## Model and report
 
-1. Create workspace and assign capacity.
-2. Provision workspace identity.
-3. Create lakehouse (SQL endpoint).
-4. Publish notebook with config values and set the daily schedule.
-5. Run notebook once to create the `um_*` tables.
-6. Create the SQL connection (workspace identity) and grant the identity workspace access.
-7. Clone the Usage Metrics model from `templateWorkspace`, swap the 6 data sources to the lakehouse, bind the connection, sync the SQL endpoint metadata, and refresh.
-8. Clone the Usage Metrics report and bind it to the new model.
+`Report views` is the fact table, related many-to-one to `Dates` and `Reports`.
+Workspace/report slicers use the report dimension. `Collection` is a disconnected
+coverage utility table, independent of report/date filters.
 
-Re-running is idempotent: items are updated in place and the schedule is replaced.
+Measures include opens, distinct viewers, active reports/workspaces, dynamic
+ranking and selected-period view trend. Trend compares equal-size first/last
+halves of selected dates; an odd middle date is excluded.
 
-## Data model
+No report-page-view, load-time or CU measures are invented. Activity Events
+cannot provide those client-performance metrics. A report inventory with zero
+opens is also outside this collector; report lists contain observed reports.
 
-| Built-in model table | Raw table (append) | Curated table (model source) | Curation rule |
-|---|---|---|---|
-| Report views | usage_metrics_report_views | um_report_views | per workspace and day, the snapshot with most rows |
-| Report page views | usage_metrics_report_page_views | um_report_page_views | same |
-| Report load times | usage_metrics_report_load_times | um_report_load_times | same |
-| Reports | usage_metrics_reports | um_reports | latest per ReportGuid (deleted reports keep their name) |
-| Report pages | usage_metrics_report_pages | um_report_pages | latest per SectionId |
-| Report rank | usage_metrics_report_rank | um_report_rank | latest per ReportId |
+## Upgrade behavior
 
-All other tables are unchanged:
-- calculated tables: Users, Dates, Workspace views, Workspace reports;
-- all 46 measures;
-- relationships, auto date tables and translations.
+The managed notebook and report definitions are replaced on deployment.
+Upgrades from the XMLA version use a new `Tenant Usage Metrics` semantic model,
+because Fabric cannot change calculated partition types in place. The legacy
+model remains; subsequent deployments update the managed tenant model.
+The earlier XMLA raw/curated tables are not deleted and are never automatically
+combined with audit data. New `audit_*` tables isolate the sources so the same
+open is not double-counted.
 
-`Dates` spans from the earliest stored day to today, so the visuals and slicers cover the full history automatically.
+## Operational requirements
 
-## Features
-
-- **Same report and model as Microsoft's.** Both are cloned at deploy time from your own Usage Metrics Report, so they track Microsoft's current version. No Microsoft content is stored in this repo.
-- **History beyond 30 days.** It is limited only by `retentionDays` (0 = forever).
-- **Configurable schedule.** The daily `scheduleTime` is set in a `scheduleTimeZone` given as a Windows time zone id. The model refreshes right after the snapshot, so there is no timing gap.
-- **Multiple workspaces.** Several source workspaces are unioned into one report. Empty `sourceWorkspaces` means auto-discover.
-- **Accurate dedup.** Overlapping 30-day windows are resolved per day, choosing the most complete snapshot.
-- **Stable users.** One UserId per UserKey across history, so a changed UPN doesn't break the `Users` lookup.
-- **Privacy option.** With `exposeIdentity=false`, UserId and UserKey are stored SHA-256 hashed.
-- **Bounded storage.** Raw days older than 35 days keep only the winning snapshot.
-- **Resilient.** XMLA calls retry on transient errors. Hidden models are probed by name. The schema is appended with mergeSchema.
-- **No stored secrets.** Model refresh uses a workspace-identity connection, and deployment uses your `az login`.
+The schedule owner must retain tenant admin API authorization. Capacity must
+be active at run time. Alert on failed notebook jobs and inspect
+`audit_ingestion_days` for coverage, not merely nonzero report counts.
+The collector cannot reconstruct days that expired before collection began.

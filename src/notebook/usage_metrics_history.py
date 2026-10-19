@@ -1,430 +1,347 @@
-# Usage Metrics History - daily snapshot
-#
-# Power BI's built-in "Usage Metrics Report" semantic model only keeps a
-# rolling ~30 days. This notebook reads that model in each source workspace
-# over XMLA (semantic-link) and:
-#
-#   1. APPENDS a full snapshot of its six source tables to Delta tables
-#      usage_metrics_<table>, stamped with SnapshotUtc (raw, append-only).
-#   2. Rebuilds curated tables um_<table> with the exact columns of the
-#      original model, deduplicated across snapshots. The "Usage Metrics
-#      History" semantic model imports these through the SQL endpoint.
-#   3. Applies retention (RETENTION_DAYS of usage history).
-#   4. Triggers a refresh of the semantic model so the report is current.
-#
-# Pattern after: https://actionablereporting.com/2026/05/12/unlimited-power-bi-usage-history-snapshot-the-built-in-usage-metrics-model-to-lakehouse/
-#
-# deploy\Deploy.ps1 publishes this file as a notebook and rewrites the
-# parameter lines below from config\settings.json. Edit the config and
-# re-deploy rather than editing the published notebook.
-#
-# Prerequisites: Fabric/Premium/PPU capacity with XMLA read, tenant setting
-# "Usage metrics for content creators" on, and someone has opened
-# "View usage metrics report" on a report in each source workspace once.
+"""Tenant-wide report usage from the Power BI Admin Activity Events REST API.
 
-import re
-import time
+No XMLA, source workspace list, or built-in Usage Metrics model is required.
+Run in Fabric with a default Lakehouse and a Fabric administrator as owner.
+"""
+
+import base64
+from collections import deque
+from datetime import date, datetime, timedelta, timezone
 import hashlib
-from datetime import datetime, timedelta, timezone
+import json
+import time
+from urllib.parse import unquote
 
-import pandas as pd
-import sempy.fabric as fabric
-from pyspark.sql import functions as F
-from pyspark.sql import Window
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType, BooleanType, LongType
-
-# Workspace names or ids to snapshot. Empty = every accessible workspace that
-# has a usage metrics model.
-SOURCE_WORKSPACES = []
-
-# Days of usage history to keep. 0 keeps everything.
 RETENTION_DAYS = 730
-
-# False = UserId/UserKey are SHA-256 hashed before they are stored.
-EXPOSE_IDENTITY = True
-
-# Semantic model refreshed at the end of the run ("" to skip).
-SEMANTIC_MODEL_NAME = "Usage Metrics History"
-
-DATASET_NAME = "Usage Metrics Report"
-RAW_PREFIX = "usage_metrics_"
-IDENTITY_COLUMNS = {"UserId", "UserKey"}
-
-SNAPSHOT_UTC = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
-TODAY = SNAPSHOT_UTC.date()
-print(f"Snapshot timestamp (UTC): {SNAPSHOT_UTC.isoformat()}  retention={RETENTION_DAYS or 'forever'} days")
-
-
-# ----------------------------------------------------------------------------
-# Curated table definitions (columns and types of the original model)
-# ----------------------------------------------------------------------------
-
-S, T, B, L = StringType(), TimestampType(), BooleanType(), LongType()
-
-# source table -> (curated table, event time column or None, [(column, type)])
-TABLES = {
-    "Report views": ("um_report_views", "CreationTime", [
-        ("ReportId", S), ("ReportType", S), ("ReportName", S), ("AppName", S), ("UserKey", S),
-        ("UserId", S), ("UserAgent", S), ("DatasetName", S), ("DistributionMethod", S),
-        ("CapacityId", S), ("CapacityName", S), ("CreationTime", T), ("OriginalConsumptionMethod", S)]),
-    "Report page views": ("um_report_page_views", "Timestamp", [
-        ("Timestamp", T), ("AppName", S), ("TenantId", S), ("UserId", S), ("ReportId", S),
-        ("OriginalReportId", S), ("WorkspaceId", S), ("OriginalWorkspaceId", S), ("AppGuid", S),
-        ("SectionId", S), ("Client", S), ("SessionSource", S), ("DeviceOSVersion", S),
-        ("DeviceBrowserVersion", S), ("UserKey", S)]),
-    "Report load times": ("um_report_load_times", "Timestamp", [
-        ("Timestamp", T), ("PbiCluster", S), ("AppName", S), ("TenantId", S), ("UserId", S),
-        ("ReportId", S), ("GroupId", S), ("Client", S), ("StartTime", T), ("EndTime", T),
-        ("DeviceOSVersion", S), ("LocationCity", S), ("Country", S), ("OriginalReportId", S),
-        ("OriginalGroupId", S), ("DeviceBrowserVersion", S), ("AppGuid", S), ("SessionSource", S)]),
-    "Reports": ("um_reports", None, [
-        ("OrganizationId", S), ("ReportGuid", S), ("ReportName", S), ("WorkspaceId", S),
-        ("IsUsageMetricsReport", B)]),
-    "Report pages": ("um_report_pages", None, [
-        ("ReportId", S), ("SectionId", S), ("SectionName", S), ("WorkspaceId", S)]),
-    "Report rank": ("um_report_rank", None, [
-        ("ReportId", S), ("WorkspaceId", S), ("ReportViewCount", L), ("ReportRank", L),
-        ("TotalReportCount", L), ("TenantId", S)]),
-}
-
-# Key that must stay unique in the model (relationship "one" side).
-DIM_KEYS = {"Reports": ["ReportGuid"], "Report pages": ["SectionId"], "Report rank": ["ReportId"]}
-
-
-def raw_name(table):
-    return RAW_PREFIX + re.sub(r"[^0-9a-z]+", "_", table.lower()).strip("_")
-
-
-def table_exists(name):
-    return spark.catalog.tableExists(name)
-
-
-# ----------------------------------------------------------------------------
-# Discover source models
-# ----------------------------------------------------------------------------
-
-def _pick_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _model_responds(ws_id):
-    # The usage metrics model is hidden and may not be listed; probe it by name.
-    try:
-        fabric.evaluate_dax(dataset=DATASET_NAME, workspace=ws_id, dax_string='EVALUATE ROW("ok", 1)')
-        return True
-    except Exception:
-        return False
-
-
-def find_usage_models():
-    all_ws = fabric.list_workspaces()
-    id_col = _pick_col(all_ws, ["Id", "id", "Workspace Id"])
-    nm_col = _pick_col(all_ws, ["Name", "name", "Workspace Name"])
-    if all_ws.empty or id_col is None or nm_col is None:
-        print(f"No workspaces visible (columns: {list(all_ws.columns)})")
-        return []
-    if SOURCE_WORKSPACES:
-        wanted = {str(w).lower() for w in SOURCE_WORKSPACES}
-        all_ws = all_ws[all_ws[id_col].astype(str).str.lower().isin(wanted)
-                        | all_ws[nm_col].astype(str).str.lower().isin(wanted)]
-        missing = wanted - set(all_ws[id_col].astype(str).str.lower()) - set(all_ws[nm_col].astype(str).str.lower())
-        for m in missing:
-            print(f"  WARNING: source workspace '{m}' not found or not accessible")
-
-    found = []
-    for _, ws in all_ws.iterrows():
-        ws_id, ws_name = str(ws[id_col]), str(ws[nm_col])
-        try:
-            ds = fabric.list_datasets(workspace=ws_id)
-        except Exception as ex:
-            print(f"  skip workspace '{ws_name}': {str(ex)[:120]}")
-            continue
-        name_col = _pick_col(ds, ["Dataset Name", "Name", "name"])
-        listed = set(ds[name_col].astype(str)) if (not ds.empty and name_col) else set()
-        if DATASET_NAME in listed or (SOURCE_WORKSPACES and _model_responds(ws_id)):
-            found.append((ws_id, ws_name))
-    return found
-
-
-models = find_usage_models()
-print(f"Found {len(models)} usage metrics model(s):")
-for ws_id, ws_name in models:
-    print(f"  {ws_name} ({ws_id})")
-if not models:
-    print("Nothing to snapshot. Open 'View usage metrics report' on a report in each "
-          "source workspace once to create the model, then re-run.")
-
-
-# ----------------------------------------------------------------------------
-# Snapshot (append to raw tables)
-# ----------------------------------------------------------------------------
-
-def clean_column(name):
-    # 'Table'[Column] -> Column, then make it Delta-safe.
-    if "[" in name:
-        name = name.split("[")[-1].rstrip("]")
-    name = re.sub(r"[^0-9A-Za-z_]+", "_", name.strip()).strip("_")
-    return name or "col"
-
-
-def _is_null(v):
-    try:
-        return v is None or bool(pd.isna(v))
-    except (TypeError, ValueError):
-        return False
-
-
-def hash_value(v):
-    if _is_null(v):
-        return None
-    return hashlib.sha256(str(v).strip().lower().encode("utf-8")).hexdigest()
-
-
-def to_text(v):
-    if _is_null(v):
-        return None
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
-    if isinstance(v, pd.Timestamp):
-        return v.strftime("%Y-%m-%d %H:%M:%S.%f")
-    return str(v)
-
-
-def evaluate_with_retry(ws_id, dax, attempts=3):
-    # The first XMLA call to a cold model can time out; retry transient errors.
-    for i in range(1, attempts + 1):
-        try:
-            return fabric.evaluate_dax(dataset=DATASET_NAME, workspace=ws_id, dax_string=dax)
-        except Exception as ex:
-            if i == attempts or not re.search(r"timed out|connection|was lost|temporar|throttl|429|503", str(ex), re.I):
-                raise
-            print(f"    transient error (attempt {i}/{attempts}), retrying: {str(ex)[:80]}")
-            time.sleep(30 * i)
-
-
-def snapshot_table(ws_id, ws_name, table):
-    escaped = table.replace("'", "''")
-    pdf = evaluate_with_retry(ws_id, f"EVALUATE '{escaped}'")
-    if pdf is None or len(pdf) == 0:
-        return 0
-
-    cols, seen = [], {}
-    for c in pdf.columns:
-        n = clean_column(c)
-        seen[n] = seen.get(n, 0) + 1
-        cols.append(n if seen[n] == 1 else f"{n}_{seen[n]}")
-    pdf.columns = cols
-
-    if not EXPOSE_IDENTITY:
-        for c in pdf.columns:
-            if c in IDENTITY_COLUMNS:
-                pdf[c] = pdf[c].map(hash_value)
-
-    # Raw tables are all-string so that type drift between runs (e.g. an int
-    # column arriving as float because of nulls) never breaks the append. The
-    # curated step casts to the model's types.
-    for c in pdf.columns:
-        pdf[c] = pdf[c].map(to_text)
-    schema = StructType([StructField(c, StringType(), True) for c in pdf.columns])
-
-    sdf = (spark.createDataFrame(pdf.astype(object).where(pd.notnull(pdf), None), schema)
-           .withColumn("SnapshotUtc", F.lit(SNAPSHOT_UTC).cast("timestamp"))
-           .withColumn("SourceWorkspaceId", F.lit(ws_id))
-           .withColumn("SourceWorkspaceName", F.lit(ws_name)))
-
-    (sdf.write.format("delta").mode("append")
-        .option("mergeSchema", "true")
-        .saveAsTable(raw_name(table)))
-    return len(pdf)
-
-
-results = []
-for ws_id, ws_name in models:
-    print(f"\n{ws_name}")
-    for table in TABLES:
-        try:
-            rows = snapshot_table(ws_id, ws_name, table)
-            results.append((ws_name, table, rows, "ok"))
-            print(f"  {table:<20} {rows:>8} rows")
-        except Exception as ex:
-            msg = (str(ex).splitlines() or [type(ex).__name__])[0][:150]
-            results.append((ws_name, table, 0, "error"))
-            print(f"  {table:<20} ERROR {msg}")
-
-errors = [r for r in results if r[3] == "error"]
-
-
-# ----------------------------------------------------------------------------
-# Retention (raw tables)
-# ----------------------------------------------------------------------------
-
-cutoff = TODAY - timedelta(days=RETENTION_DAYS) if RETENTION_DAYS else None
-
-if cutoff:
-    for table, (_, ts_col, _) in TABLES.items():
-        raw = raw_name(table)
-        if not table_exists(raw):
-            continue
-        if ts_col:
-            spark.sql(f"DELETE FROM {raw} WHERE to_date({ts_col}) < DATE'{cutoff}'")
-        else:
-            # Keep at least the latest snapshot of each dimension.
-            latest = spark.table(raw).agg(F.max("SnapshotUtc")).first()[0]
-            keep_from = min(datetime.combine(cutoff, datetime.min.time()), latest) if latest else None
-            if keep_from:
-                spark.sql(f"DELETE FROM {raw} WHERE SnapshotUtc < TIMESTAMP'{keep_from:%Y-%m-%d %H:%M:%S}'")
-    print(f"Retention: removed usage older than {cutoff}.")
-else:
-    print("Retention: disabled, keeping all history.")
-
-
-# ----------------------------------------------------------------------------
-# Build curated tables (um_*)
-# ----------------------------------------------------------------------------
-
-def conform(df, columns):
-    # Select the model's columns with the model's types; missing ones are null.
-    out = []
-    for name, dtype in columns:
-        if name not in df.columns:
-            out.append(F.lit(None).cast(dtype).alias(name))
-        elif isinstance(dtype, BooleanType):
-            out.append(F.lower(F.col(name).cast("string")).isin("true", "1").alias(name))
-        elif isinstance(dtype, TimestampType):
-            out.append(F.to_timestamp(F.col(name)).alias(name))
-        else:
-            out.append(F.col(name).cast(dtype).alias(name))
-    return out
-
-
-def best_snapshot_rows(df, ts_col):
-    # Each snapshot repeats the trailing ~30 days. For every source workspace and
-    # event date, keep the snapshot that holds the most rows for that date (the
-    # most complete one); ties go to the newest snapshot.
-    df = df.withColumn("_d", F.to_date(F.col(ts_col)))
-    counts = df.groupBy("SourceWorkspaceId", "_d", "SnapshotUtc").count()
-    w = Window.partitionBy("SourceWorkspaceId", "_d").orderBy(F.desc("count"), F.desc("SnapshotUtc"))
-    best = (counts.withColumn("_rn", F.row_number().over(w))
-            .filter("_rn = 1").select("SourceWorkspaceId", "_d", "SnapshotUtc"))
-    return df.join(best, ["SourceWorkspaceId", "_d", "SnapshotUtc"]), best
-
-
-def latest_per_key(df, keys):
-    w = Window.partitionBy(*keys).orderBy(F.desc("SnapshotUtc"))
-    return df.withColumn("_rn", F.row_number().over(w)).filter("_rn = 1").drop("_rn")
-
-
-def unify_user_ids(df, ts_col):
-    # The model's Users table looks up one UserId per UserKey, so a user whose
-    # UPN changed during the retained history must resolve to a single value.
-    if "UserKey" not in df.columns or "UserId" not in df.columns:
-        return df
-    w = Window.partitionBy("UserKey").orderBy(F.desc(ts_col))
-    latest = (df.filter(F.col("UserKey").isNotNull())
-              .withColumn("_rn", F.row_number().over(w)).filter("_rn = 1")
-              .select("UserKey", F.col("UserId").alias("_uid")))
-    return (df.join(latest, "UserKey", "left")
-            .withColumn("UserId", F.coalesce("_uid", "UserId")).drop("_uid"))
-
-
-curated_counts = {}
-for table, (target, ts_col, columns) in TABLES.items():
-    raw = raw_name(table)
-    if table_exists(raw):
-        df = spark.table(raw)
-        if ts_col:
-            df, _ = best_snapshot_rows(df, ts_col)
-            if cutoff:
-                df = df.filter(F.col("_d") >= F.lit(cutoff))
-        else:
-            df = latest_per_key(df, DIM_KEYS[table])
-        out = df.select(*conform(df, columns))
-        if ts_col:
-            out = unify_user_ids(out, ts_col)
-            out = out.select(*[c for c, _ in columns])
-        out = out.filter(" AND ".join(f"{k} IS NOT NULL" for k in DIM_KEYS.get(table, [])) or "1=1")
-    else:
-        out = spark.createDataFrame([], StructType([StructField(c, t, True) for c, t in columns]))
-
-    (out.write.format("delta").mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(target))
-    curated_counts[target] = spark.table(target).count()
-    print(f"  {target:<24} {curated_counts[target]:>9} rows")
-
-
-# ----------------------------------------------------------------------------
-# Compact raw facts
-# ----------------------------------------------------------------------------
-
-# Dates older than the source window (~30 days) can no longer change, so only
-# the winning snapshot of those dates is kept. Raw storage stays ~1x instead
-# of growing ~30x.
-SETTLED = TODAY - timedelta(days=35)
-for table, (_, ts_col, _) in TABLES.items():
-    raw = raw_name(table)
-    if not ts_col or not table_exists(raw):
-        continue
-    df = spark.table(raw).withColumn("_d", F.to_date(F.col(ts_col)))
-    counts = df.groupBy("SourceWorkspaceId", "_d", "SnapshotUtc").count()
-    w = Window.partitionBy("SourceWorkspaceId", "_d").orderBy(F.desc("count"), F.desc("SnapshotUtc"))
-    losers = (counts.withColumn("_rn", F.row_number().over(w))
-              .filter(f"_rn > 1 AND _d < DATE'{SETTLED}'")
-              .select("SourceWorkspaceId", "_d", "SnapshotUtc"))
-    losers.createOrReplaceTempView("_losers")
-    spark.sql(f"""
-        MERGE INTO {raw} t
-        USING _losers s
-        ON t.SourceWorkspaceId = s.SourceWorkspaceId
-           AND to_date(t.{ts_col}) = s._d
-           AND t.SnapshotUtc = s.SnapshotUtc
-        WHEN MATCHED THEN DELETE""")
-
-
-# ----------------------------------------------------------------------------
-# Health check and model refresh
-# ----------------------------------------------------------------------------
-
-for table, (target, ts_col, _) in TABLES.items():
-    if ts_col:
-        s = spark.sql(f"""SELECT COUNT(*) AS n, MIN(to_date({ts_col})) AS first_day,
-                                 MAX(to_date({ts_col})) AS last_day,
-                                 COUNT(DISTINCT to_date({ts_col})) AS days
-                          FROM {target}""").first()
-        print(f"{target:<24} rows={s.n:<9} days={s.days:<5} first={s.first_day} last={s.last_day}")
-
-def sync_sql_endpoint():
-    # The model reads through the SQL endpoint, whose metadata can lag behind new Delta tables.
-    import time
-    client = fabric.FabricRestClient()
-    ws = fabric.get_workspace_id()
-    lh_id = notebookutils.runtime.context.get("defaultLakehouseId")
-    lh = client.get(f"v1/workspaces/{ws}/lakehouses/{lh_id}").json()
-    ep_id = lh["properties"]["sqlEndpointProperties"]["id"]
-    r = client.post(f"v1/workspaces/{ws}/sqlEndpoints/{ep_id}/refreshMetadata", json={})
-    if r.status_code == 202 and r.headers.get("Location"):
-        for _ in range(60):
-            time.sleep(int(r.headers.get("Retry-After", 5)))
-            st = client.get(r.headers["Location"]).json().get("status")
-            if st in ("Succeeded", "Failed", "Cancelled"):
+BACKFILL_DAYS = 27
+REPLAY_DAYS = 3
+EXPOSE_IDENTITY = False
+SEMANTIC_MODEL_NAME = "Tenant Usage Metrics"
+
+API_ROOT = "https://api.powerbi.com/v1.0/myorg"
+STRING_FIELDS = [
+    "EventKey", "Id", "TenantId", "CreationTime", "Activity", "ReportId",
+    "ReportName", "WorkspaceId", "WorkspaceName", "UserId", "UserKey",
+    "DistributionMethod", "ConsumptionMethod", "CapacityId", "CapacityName",
+    "DatasetId", "DatasetName", "AppName", "ReportType", "IsSuccess",
+]
+VIEW_COLUMNS = [
+    "EventKey", "EventDate", "ReportKey", "WorkspaceId", "UserId",
+    "DistributionMethod", "ConsumptionMethod",
+]
+
+
+def utc_today():
+    return datetime.now(timezone.utc).date()
+
+
+def retention_cutoff(today, days):
+    if days < 0:
+        raise ValueError("retentionDays must be nonnegative")
+    return today - timedelta(days=days - 1) if days else None
+
+
+def days_to_fetch(today, completed, backfill_days, replay_days):
+    if not 1 <= backfill_days <= 27 or not 1 <= replay_days <= 27:
+        raise ValueError("backfillDays and replayDays must be between 1 and 27")
+    earliest = today - timedelta(days=27)
+    first = min(completed) if completed else today - timedelta(days=backfill_days)
+    start = max(earliest, first)
+    return [
+        start + timedelta(days=i)
+        for i in range((today - start).days)
+        if start + timedelta(days=i) not in completed
+        or start + timedelta(days=i) >= today - timedelta(days=replay_days)
+    ]
+
+
+def normalize_event(event, tenant_id, requested_day, expose_identity):
+    if event.get("Activity", event.get("Operation")) != "ViewReport":
+        raise ValueError("Activity Events returned an unexpected activity")
+    event_id = event.get("Id")
+    timestamp = event.get("CreationTime")
+    if not event_id or not timestamp:
+        raise ValueError("Activity event is missing Id or CreationTime")
+    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    event_day = (parsed.astimezone(timezone.utc).date() if parsed.tzinfo else parsed.date())
+    if event_day != requested_day:
+        raise ValueError("Activity event is outside its requested UTC day")
+    organization = event.get("OrganizationId") or tenant_id
+    if organization.lower() != tenant_id.lower():
+        raise ValueError("Activity event belongs to a different tenant")
+    row = {key: None if event.get(key) is None else str(event[key])
+           for key in STRING_FIELDS}
+    row.update({
+        "EventKey": f"{tenant_id}:{event_id}",
+        "TenantId": tenant_id,
+        "Activity": "ViewReport",
+        "EventDate": event_day,
+        "WorkspaceName": event.get("WorkSpaceName") or event.get("WorkspaceName"),
+        "ReportId": event.get("ReportId") or event.get("ObjectId"),
+        "ReportName": event.get("ReportName") or event.get("ItemName"),
+    })
+    for field in ("UserId", "UserKey"):
+        if row[field] and not expose_identity:
+            row[field] = hashlib.sha256(row[field].strip().lower().encode()).hexdigest()
+    return row
+
+
+class ActivityClient:
+    """Follow all continuation tokens, including empty intermediate pages."""
+
+    def __init__(self, token_provider, session=None, sleep=time.sleep,
+                 clock=time.monotonic):
+        if session is None:
+            import requests
+            session = requests.Session()
+        self.session = session
+        self.token_provider = token_provider
+        self.sleep = sleep
+        self.clock = clock
+        self.requests = deque()
+
+    def get(self, params):
+        from requests.exceptions import ConnectionError, Timeout
+
+        for attempt in range(6):
+            now = self.clock()
+            while self.requests and now - self.requests[0] >= 3600:
+                self.requests.popleft()
+            if len(self.requests) >= 180:
+                self.sleep(max(1, 3601 - (now - self.requests[0])))
+                continue
+            self.requests.append(self.clock())
+            try:
+                response = self.session.get(
+                    f"{API_ROOT}/admin/activityevents", params=params,
+                    headers={"Authorization": f"Bearer {self.token_provider()}"},
+                    timeout=(30, 120),
+                )
+            except (ConnectionError, Timeout):
+                if attempt == 5:
+                    raise
+                delay = min(120, 2 ** attempt * 5)
+                print(f"Activity Events connection failure; retry in {delay}s")
+                self.sleep(delay)
+                continue
+            if response.status_code in (401, 403):
+                raise PermissionError(
+                    f"Activity Events HTTP {response.status_code}. The notebook owner "
+                    "must be a Fabric administrator with delegated Tenant.Read.All "
+                    "or Tenant.ReadWrite.All. Workspace access alone is insufficient."
+                )
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 5:
+                retry = response.headers.get("Retry-After", "")
+                delay = int(retry) if retry.isdigit() else min(120, 2 ** attempt * 5)
+                print(f"Activity Events HTTP {response.status_code}; retry in {delay}s")
+                self.sleep(delay)
+                continue
+            response.raise_for_status()
+            result = response.json()
+            if "activityEventEntities" not in result:
+                raise ValueError("Activity Events response has no activityEventEntities")
+            return result
+        raise TimeoutError("Activity Events retry/request budget exhausted")
+
+    def pages(self, day):
+        params = {
+            "startDateTime": f"'{day.isoformat()}T00:00:00.000Z'",
+            "endDateTime": f"'{day.isoformat()}T23:59:59.999Z'",
+            "$filter": "Activity eq 'ViewReport'",
+        }
+        seen = set()
+        while True:
+            result = self.get(params)
+            yield result["activityEventEntities"]
+            token = result.get("continuationToken")
+            if not token:
+                if result.get("continuationUri"):
+                    raise ValueError("Continuation URI returned without a token")
                 break
-    print("SQL endpoint metadata synced.")
+            if token in seen:
+                raise ValueError("Activity Events repeated a continuation token")
+            seen.add(token)
+            params = {"continuationToken": "'" + unquote(token).strip("'") + "'"}
 
-if SEMANTIC_MODEL_NAME and not errors:
-    try:
-        sync_sql_endpoint()
-    except Exception as ex:
-        print(f"SQL endpoint sync skipped: {str(ex)[:200]}")
-    try:
-        own_ws = fabric.get_workspace_id()
-        fabric.refresh_dataset(dataset=SEMANTIC_MODEL_NAME, workspace=own_ws, refresh_type="full")
-        print(f"Refresh of '{SEMANTIC_MODEL_NAME}' requested.")
-    except Exception as ex:
-        print(f"Semantic model refresh not requested: {str(ex)[:200]}")
 
-if errors:
-    raise RuntimeError(f"{len(errors)} table(s) failed to snapshot: "
-                       + ", ".join(f"{w}/{t}" for w, t, _, _ in errors))
+def main():
+    from delta.tables import DeltaTable
+    from pyspark.sql import functions as F, Window
+    from pyspark.sql.types import (
+        StructType, StructField, StringType, DateType, TimestampType, LongType,
+    )
+    import notebookutils
+
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    today = utc_today()
+    cutoff = retention_cutoff(today, RETENTION_DAYS)
+    if not isinstance(EXPOSE_IDENTITY, bool):
+        raise ValueError("exposeIdentity must be a JSON boolean")
+    token_provider = lambda: notebookutils.credentials.getToken("pbi")
+    token = token_provider()
+    claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==="))
+    tenant_id = claims["tid"]
+    client = ActivityClient(token_provider)
+    raw_schema = StructType(
+        [StructField(c, StringType(), True) for c in STRING_FIELDS]
+        + [StructField("EventDate", DateType(), False),
+           StructField("IngestedUtc", TimestampType(), False)]
+    )
+    checkpoint_schema = StructType([
+        StructField("TenantId", StringType(), False),
+        StructField("EventDate", DateType(), False),
+        StructField("CompletedUtc", TimestampType(), False),
+        StructField("ReturnedRows", LongType(), False),
+    ])
+    for name, schema in (("audit_report_events", raw_schema),
+                         ("audit_ingestion_days", checkpoint_schema)):
+        if not spark.catalog.tableExists(name):
+            spark.createDataFrame([], schema).write.format("delta").saveAsTable(name)
+
+    completed = {
+        r.EventDate for r in spark.table("audit_ingestion_days")
+        .filter(F.col("TenantId") == tenant_id).select("EventDate").collect()
+    }
+    # Detect collection gaps that can no longer be recovered from the 28-day API.
+    gaps = []
+    if completed:
+        first = max(min(completed), cutoff) if cutoff else min(completed)
+        earliest = today - timedelta(days=27)
+        gaps = [first + timedelta(days=i)
+                for i in range(max(0, (earliest - first).days))
+                if first + timedelta(days=i) not in completed]
+
+    planned = days_to_fetch(today, completed, BACKFILL_DAYS, REPLAY_DAYS)
+    for day in planned:
+        returned = 0
+        for events in client.pages(day):
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            rows = [dict(normalize_event(e, tenant_id, day, EXPOSE_IDENTITY),
+                         IngestedUtc=now) for e in events]
+            if rows:
+                batch = spark.createDataFrame(rows, raw_schema).dropDuplicates(["EventKey"])
+                (DeltaTable.forName(spark, "audit_report_events").alias("t")
+                 .merge(batch.alias("s"), "t.EventKey = s.EventKey")
+                 .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
+            returned += len(rows)
+        done = spark.createDataFrame(
+            [(tenant_id, day, datetime.now(timezone.utc).replace(tzinfo=None), returned)],
+            checkpoint_schema,
+        )
+        (DeltaTable.forName(spark, "audit_ingestion_days").alias("t")
+         .merge(done.alias("s"), "t.TenantId = s.TenantId AND t.EventDate = s.EventDate")
+         .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
+        print(f"{day}: all pages committed, {returned} report-open events returned")
+
+    if cutoff:
+        for name in ("audit_report_events", "audit_ingestion_days"):
+            DeltaTable.forName(spark, name).delete(F.col("EventDate") < F.lit(cutoff))
+
+    events = spark.table("audit_report_events").filter(
+        (F.col("Activity") == "ViewReport")
+        & (F.lower(F.coalesce("IsSuccess", F.lit("true"))) != "false")
+    )
+    events = events.withColumn("WorkspaceId", F.coalesce("WorkspaceId", F.lit("Unknown")))
+    events = events.withColumn("ReportId", F.coalesce("ReportId", F.lit("Unknown")))
+    events = events.withColumn(
+        "ReportKey", F.concat_ws(":", "TenantId", "WorkspaceId", "ReportId")
+    )
+    for col in ("DistributionMethod", "ConsumptionMethod"):
+        events = events.withColumn(col, F.coalesce(F.col(col), F.lit("Unknown")))
+    latest = Window.partitionBy("ReportKey").orderBy(
+        F.desc("CreationTime"), F.desc("EventKey")
+    )
+    reports = (events.withColumn("_rn", F.row_number().over(latest)).filter("_rn = 1")
+               .select("ReportKey", "ReportId", "ReportName", "WorkspaceId", "WorkspaceName")
+               .withColumn("ReportName", F.coalesce("ReportName", "ReportId"))
+               .withColumn("WorkspaceName", F.coalesce("WorkspaceName", "WorkspaceId")))
+    first = events.agg(F.min("EventDate")).first()[0] or today - timedelta(days=26)
+    dates = spark.sql(
+        f"SELECT explode(sequence(DATE'{first}', DATE'{today}', interval 1 day)) AS Date"
+    ).withColumn("Year", F.year("Date")).withColumn(
+        "Month", F.date_format("Date", "yyyy-MM")
+    )
+    for name, df in (
+        ("audit_report_views", events.select(*VIEW_COLUMNS)),
+        ("audit_reports", reports),
+        ("audit_dates", dates),
+    ):
+        df.write.format("delta").mode("overwrite").option(
+            "overwriteSchema", "true"
+        ).saveAsTable(name)
+        print(f"{name}: {spark.table(name).count()} rows")
+
+    if gaps:
+        raise RuntimeError(
+            f"{len(gaps)} UTC days could not be recovered (first: {gaps[0]}). "
+            "The API only exposes the last 28 days. Curated data was updated, "
+            "but coverage is incomplete; inspect audit_ingestion_days."
+        )
+
+    if SEMANTIC_MODEL_NAME:
+        import sempy.fabric as fabric
+        workspace = notebookutils.runtime.context["currentWorkspaceId"]
+        lakehouse = notebookutils.runtime.context["defaultLakehouseId"]
+        rest = fabric.FabricRestClient()
+        headers = {"x-ms-fabric-skill": "spark-cli"}
+        lh = rest.get(f"v1/workspaces/{workspace}/lakehouses/{lakehouse}",
+                      headers=headers).json()
+        endpoint = lh["properties"]["sqlEndpointProperties"]["id"]
+        response = rest.post(
+            f"v1/workspaces/{workspace}/sqlEndpoints/{endpoint}/refreshMetadata",
+            json={}, headers=headers,
+        )
+        response.raise_for_status()
+        if response.status_code == 202:
+            location = response.headers["Location"]
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                time.sleep(5)
+                poll = rest.get(location, headers=headers)
+                poll.raise_for_status()
+                status = poll.json()["status"]
+                if status == "Succeeded":
+                    break
+                if status in ("Failed", "Cancelled"):
+                    raise RuntimeError(f"SQL metadata sync {status}")
+            else:
+                raise TimeoutError("SQL metadata sync timed out")
+        datasets = []
+        url = f"v1/workspaces/{workspace}/semanticModels"
+        while url:
+            response = rest.get(url, headers=headers)
+            response.raise_for_status()
+            page = response.json()
+            datasets.extend(page["value"])
+            url = page.get("continuationUri")
+        models = [m for m in datasets if m["displayName"] == SEMANTIC_MODEL_NAME]
+        if len(models) != 1:
+            raise RuntimeError(f"Expected one semantic model '{SEMANTIC_MODEL_NAME}'")
+        model_id = models[0]["id"]
+        # Refresh through REST, not XMLA; fail the run if the refresh fails.
+        import requests
+        refresh_url = f"{API_ROOT}/groups/{workspace}/datasets/{model_id}/refreshes"
+        auth = lambda: {"Authorization": f"Bearer {token_provider()}"}
+        response = requests.post(refresh_url, headers=auth(),
+                                 json={"type": "full"}, timeout=120)
+        response.raise_for_status()
+        location = response.headers.get("Location")
+        if not location:
+            raise RuntimeError("Refresh response has no Location for status tracking")
+        deadline = time.monotonic() + 1800
+        while time.monotonic() < deadline:
+            time.sleep(15)
+            response = requests.get(location, headers=auth(), timeout=120)
+            response.raise_for_status()
+            status = response.json().get("status")
+            if status == "Completed":
+                print("Semantic model refresh completed")
+                break
+            if status in ("Failed", "Cancelled", "Disabled"):
+                raise RuntimeError(f"Semantic model refresh {status}")
+        else:
+            raise TimeoutError("Semantic model refresh timed out")
+
+
+if __name__ == "__main__":
+    main()
